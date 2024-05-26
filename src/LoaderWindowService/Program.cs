@@ -1,8 +1,11 @@
-var builder = WebApplication.CreateBuilder(args);
+using LoaderWindowService;
 
-// Add services to the container.
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddWindowsService();
+builder.Services.AddHostedService<WorkerHostedService>();
 
 var app = builder.Build();
-
 app.MapGet("/", () => "ok");
+
+
 app.Run();
