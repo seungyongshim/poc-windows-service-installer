@@ -1,6 +1,8 @@
 
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Security;
+using System.Security.Permissions;
 
 namespace LoaderWindowService;
 
@@ -11,128 +13,117 @@ internal class WorkerHostedService
 {
     protected override Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var hToken = IntPtr.Zero;
-        var hDupToken = IntPtr.Zero;
-        var hPToken = IntPtr.Zero;
-        var hProcess = IntPtr.Zero;
-
-        try
-        {
-            // 현재 콘솔 세션의 ID를 가져옴
-            uint dwSessionId = WTSGetActiveConsoleSessionId();
-
-            // 시스템 프로세스의 핸들을 가져옴
-            hProcess = OpenProcess(ProcessAccessFlags.QueryInformation, false, 4); // 4는 시스템 프로세스 ID
-
-            // 시스템 프로세스의 토큰을 가져옴
-            if (!OpenProcessToken(hProcess, TokenAccessLevels.Duplicate, out hToken))
-            {
-                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-            }
-
-            // 토큰을 복제함
-            if (!DuplicateTokenEx(hToken, TokenAccessLevels.MaximumAllowed, IntPtr.Zero, SecurityImpersonationLevel.Impersonation, TokenType.Primary, out hDupToken))
-            {
-                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-            }
-
-            // 세션 토큰을 설정함
-            if (!SetTokenInformation(hDupToken, TokenInformationClass.TokenSessionId, ref dwSessionId, (uint)IntPtr.Size))
-            {
-                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-            }
-
-            // 세션 토큰을 사용하여 프로세스를 시작함
-            var si = new STARTUPINFO();
-            var pi = new PROCESS_INFORMATION();
-            si.cb = Marshal.SizeOf(si);
-
-            if (!CreateProcessAsUser(hDupToken, null, "cmd.exe", IntPtr.Zero, IntPtr.Zero, false, 0, IntPtr.Zero, null, ref si, out pi))
-            {
-                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-            }
-        }
-        finally
-        {
-            // 리소스 해제
-            if (hToken != IntPtr.Zero)
-                CloseHandle(hToken);
-            if (hDupToken != IntPtr.Zero)
-                CloseHandle(hDupToken);
-            if (hProcess != IntPtr.Zero)
-                CloseHandle(hProcess);
-        }
-
-        Process.Start("notepad.exe");
+        var ret = StartProcessAndBypassUAC(applicationName: "notepad.exe", out var procInfo);
         return Task.CompletedTask;
     }
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern uint WTSGetActiveConsoleSessionId();
-
-    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-    private static extern bool OpenProcessToken(IntPtr ProcessHandle, TokenAccessLevels DesiredAccess, out IntPtr TokenHandle);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern IntPtr OpenProcess(ProcessAccessFlags processAccess, bool bInheritHandle, int processId);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool CloseHandle(IntPtr hObject);
-
-    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-    private static extern bool DuplicateTokenEx(IntPtr hExistingToken, TokenAccessLevels dwDesiredAccess, IntPtr lpTokenAttributes, SecurityImpersonationLevel ImpersonationLevel, TokenType TokenType, out IntPtr phNewToken);
-
-    [DllImport("advapi32.dll", SetLastError = true)]
-    private static extern bool SetTokenInformation(IntPtr TokenHandle, TokenInformationClass TokenInformationClass, ref uint TokenInformation, uint TokenInformationLength);
-
-    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-    private static extern bool CreateProcessAsUser(IntPtr hToken, string lpApplicationName, string lpCommandLine, IntPtr lpProcessAttributes, IntPtr lpThreadAttributes, bool bInheritHandles, uint dwCreationFlags, IntPtr lpEnvironment, string lpCurrentDirectory, ref STARTUPINFO lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
-
-    private enum ProcessAccessFlags : uint
+    public static bool StartProcessAndBypassUAC(String applicationName, out PROCESS_INFORMATION procInfo)
     {
-        QueryInformation = 0x0400
+        uint winlogonPid = 0;
+        IntPtr hUserTokenDup = IntPtr.Zero, hPToken = IntPtr.Zero, hProcess = IntPtr.Zero;
+        procInfo = new PROCESS_INFORMATION();
+
+        // 현재 활성 세션 ID를 얻습니다; 시스템에 로그인한 모든 사용자는 고유한 세션 ID를 가집니다.
+        uint dwSessionId = WTSGetActiveConsoleSessionId();
+
+        // 현재 활성 세션에서 실행 중인 winlogon 프로세스의 프로세스 ID를 얻습니다.
+        var processes = Process.GetProcessesByName("winlogon");
+        foreach (var p in processes)
+        {
+            if ((uint)p.SessionId == dwSessionId)
+            {
+                winlogonPid = (uint)p.Id;
+            }
+        }
+
+        // winlogon 프로세스에 대한 핸들을 얻습니다.
+        hProcess = OpenProcess(MAXIMUM_ALLOWED, false, winlogonPid);
+
+        // winlogon 프로세스의 액세스 토큰에 대한 핸들을 얻습니다.
+        if (!OpenProcessToken(hProcess, TOKEN_DUPLICATE, ref hPToken))
+        {
+            CloseHandle(hProcess);
+            return false;
+        }
+
+        // DuplicateTokenEx 및 CreateProcessAsUser에서 사용되는 보안 속성 구조체
+        // 보안 속성 변수를 사용하지 않고 단순히 null을 전달하여 기존 토큰의 보안 속성을 상속받고 싶습니다.
+        // 그러나 C# 구조체는 값 형식이므로 null 값을 할당할 수 없습니다.
+        SECURITY_ATTRIBUTES sa = new SECURITY_ATTRIBUTES();
+        sa.Length = Marshal.SizeOf(sa);
+
+        // winlogon 프로세스의 액세스 토큰을 복사합니다; 새로 생성된 토큰은 기본 토큰이 됩니다.
+        if (!DuplicateTokenEx(hPToken, MAXIMUM_ALLOWED, ref sa, (int)SECURITY_IMPERSONATION_LEVEL.SecurityIdentification, (int)TOKEN_TYPE.TokenPrimary, ref hUserTokenDup))
+        {
+            CloseHandle(hProcess);
+            CloseHandle(hPToken);
+            return false;
+        }
+
+        var si = new STARTUPINFO();
+        si.cb = (int)Marshal.SizeOf(si);
+        si.lpDesktop = @"winsta0\default";
+
+        // 프로세스의 우선 순위 및 생성 방법을 지정하는 플래그
+        int dwCreationFlags = NORMAL_PRIORITY_CLASS | CREATE_NEW_CONSOLE;
+
+        // 현재 사용자의 로그인 세션에서 새 프로세스를 생성합니다.
+        bool result = CreateProcessAsUser
+        (
+            hUserTokenDup,        // 클라이언트의 액세스 토큰
+            null,                   // 실행할 파일
+            applicationName,        // 명령줄
+            ref sa,                 // 프로세스 SECURITY_ATTRIBUTES에 대한 포인터
+            ref sa,                 // 스레드 SECURITY_ATTRIBUTES에 대한 포인터
+            false,                  // 핸들은 상속되지 않습니다.
+            dwCreationFlags,        // 생성 플래그
+            IntPtr.Zero,            // 새 환경 블록에 대한 포인터
+            null,                   // 현재 디렉터리 이름
+            ref si,                 // STARTUPINFO 구조체에 대한 포인터
+            out procInfo            // 새 프로세스에 대한 정보를 받습니다.
+        );
+
+        if (!result)
+        {
+            int error = Marshal.GetLastWin32Error();
+            Console.WriteLine($"프로세스 생성에 실패했습니다. 오류 코드: {error}");
+            Console.WriteLine($"오류 메시지: {new System.ComponentModel.Win32Exception(error).Message}");
+        }
+
+        // 핸들을 무효화합니다.
+        CloseHandle(hProcess);
+        CloseHandle(hPToken);
+        CloseHandle(hUserTokenDup);
+
+        return result; // 결과를 반환합니다.
+
     }
 
-    private enum TokenAccessLevels
-    {
-        Duplicate = 0x0002,
-        MaximumAllowed = 0x02000000
-    }
+    #region 구조체
 
-    private enum SecurityImpersonationLevel
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SECURITY_ATTRIBUTES
     {
-        Anonymous = 0,
-        Identification = 1,
-        Impersonation = 2,
-        Delegation = 3
-    }
-
-    private enum TokenType
-    {
-        Primary = 1,
-        Impersonation = 2
-    }
-
-    private enum TokenInformationClass
-    {
-        TokenSessionId = 12
+        public int Length;
+        public IntPtr lpSecurityDescriptor;
+        public bool bInheritHandle;
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct STARTUPINFO
+    public struct STARTUPINFO
     {
         public int cb;
-        public string lpReserved;
-        public string lpDesktop;
-        public string lpTitle;
-        public int dwX;
-        public int dwY;
-        public int dwXSize;
-        public int dwYSize;
-        public int dwXCountChars;
-        public int dwYCountChars;
-        public int dwFillAttribute;
-        public int dwFlags;
+        public String lpReserved;
+        public String lpDesktop;
+        public String lpTitle;
+        public uint dwX;
+        public uint dwY;
+        public uint dwXSize;
+        public uint dwYSize;
+        public uint dwXCountChars;
+        public uint dwYCountChars;
+        public uint dwFillAttribute;
+        public uint dwFlags;
         public short wShowWindow;
         public short cbReserved2;
         public IntPtr lpReserved2;
@@ -142,11 +133,73 @@ internal class WorkerHostedService
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct PROCESS_INFORMATION
+    public struct PROCESS_INFORMATION
     {
         public IntPtr hProcess;
         public IntPtr hThread;
-        public int dwProcessId;
-        public int dwThreadId;
+        public uint dwProcessId;
+        public uint dwThreadId;
     }
+
+    #endregion
+
+    #region 열거형
+
+    enum TOKEN_TYPE : int
+    {
+        TokenPrimary = 1,
+        TokenImpersonation = 2
+    }
+
+    enum SECURITY_IMPERSONATION_LEVEL : int
+    {
+        SecurityAnonymous = 0,
+        SecurityIdentification = 1,
+        SecurityImpersonation = 2,
+        SecurityDelegation = 3,
+    }
+
+    #endregion
+
+    #region 상수
+
+    public const int TOKEN_DUPLICATE = 0x0002;
+    public const uint MAXIMUM_ALLOWED = 0x2000000;
+    public const int CREATE_NEW_CONSOLE = 0x00000010;
+
+    public const int IDLE_PRIORITY_CLASS = 0x40;
+    public const int NORMAL_PRIORITY_CLASS = 0x20;
+    public const int HIGH_PRIORITY_CLASS = 0x80;
+    public const int REALTIME_PRIORITY_CLASS = 0x100;
+
+    #endregion
+
+    #region Win32 API 가져오기
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hSnapshot);
+
+    [DllImport("kernel32.dll")]
+    static extern uint WTSGetActiveConsoleSessionId();
+
+    [DllImport("advapi32.dll", EntryPoint = "CreateProcessAsUser", SetLastError = true, CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
+    public extern static bool CreateProcessAsUser(IntPtr hToken, String lpApplicationName, String lpCommandLine, ref SECURITY_ATTRIBUTES lpProcessAttributes,
+        ref SECURITY_ATTRIBUTES lpThreadAttributes, bool bInheritHandle, int dwCreationFlags, IntPtr lpEnvironment,
+        String lpCurrentDirectory, ref STARTUPINFO lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
+
+    [DllImport("kernel32.dll")]
+    static extern bool ProcessIdToSessionId(uint dwProcessId, ref uint pSessionId);
+
+    [DllImport("advapi32.dll", EntryPoint = "DuplicateTokenEx")]
+    public extern static bool DuplicateTokenEx(IntPtr ExistingTokenHandle, uint dwDesiredAccess,
+        ref SECURITY_ATTRIBUTES lpThreadAttributes, int TokenType,
+        int ImpersonationLevel, ref IntPtr DuplicateTokenHandle);
+
+    [DllImport("kernel32.dll")]
+    static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+    [DllImport("advapi32", SetLastError = true), SuppressUnmanagedCodeSecurityAttribute]
+    static extern bool OpenProcessToken(IntPtr ProcessHandle, int DesiredAccess, ref IntPtr TokenHandle);
+
+    #endregion
 }
