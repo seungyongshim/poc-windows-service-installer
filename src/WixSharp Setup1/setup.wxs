@@ -1,0 +1,16 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:netfx="http://wixtoolset.org/schemas/v4/wxs/netfx" xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+  <Bundle Name="MyProduct" UpgradeCode="6f330b47-2577-43ad-9095-1861bb25844b" Version="1.0.0.0" >
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense" LicenseUrl="" />
+    </BootstrapperApplication>
+
+    <Chain>
+      <PackageGroupRef Id="NetFx462Web" />
+
+      <MsiPackage SourceFile="MyProduct.msi" bal:DisplayInternalUICondition="WixBundleAction = 6">
+        <MsiProperty Name="WIXBUNDLEORIGINALSOURCE" Value="[WixBundleOriginalSource]" />
+      </MsiPackage>
+    </Chain>
+  </Bundle>
+</Wix>
+
