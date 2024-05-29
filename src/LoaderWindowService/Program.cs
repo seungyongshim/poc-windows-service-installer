@@ -7,5 +7,4 @@ builder.Services.AddHostedService<WorkerHostedService>();
 var app = builder.Build();
 app.MapGet("/", () => "ok");
 
-
 app.Run();
